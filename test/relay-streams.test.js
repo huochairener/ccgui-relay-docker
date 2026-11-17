@@ -60,13 +60,19 @@ test("open+body+end serializes onto agent socket in order", () => {
   assert.ok(promise instanceof Promise);
 });
 
-test("head+data+close frames resolve the stream response", async () => {
+test("head+data+close frames stream the response via callbacks", async () => {
   const session = waitingSession();
+  const chunks = [];
+  let closed = false;
   const pending = session.openHttpStream({
     method: "GET",
     path: "/a",
     headers: {},
     body: new Uint8Array(0),
+    onChunk: (bytes) => chunks.push(bytes),
+    onClose: () => {
+      closed = true;
+    },
   });
   const id = 1;
   session.agent.emitMessage(
@@ -79,8 +85,10 @@ test("head+data+close frames resolve the stream response", async () => {
   const res = await pending;
   assert.equal(res.status, 200);
   assert.equal(res.headers["x-a"], "b");
-  assert.equal(Buffer.concat(res.chunks).toString(), "part");
-  assert.equal(res.done, true);
+  assert.equal(Buffer.concat(chunks).toString(), "part");
+  await new Promise((r) => setImmediate(r)); // onClose is macrotask-deferred
+  assert.equal(closed, true);
+  assert.equal(session.streamCount(), 0);
 });
 
 test("empty request body omits the body frame", () => {
@@ -99,17 +107,20 @@ test("empty request body omits the body frame", () => {
 
 test("stream died before head yields 502 with error message", async () => {
   const session = waitingSession();
+  const chunks = [];
   const pending = session.openHttpStream({
     method: "GET",
     path: "/a",
     headers: {},
     body: new Uint8Array(0),
+    onChunk: (bytes) => chunks.push(bytes),
+    onClose: () => {},
   });
   session.agent.emitMessage(JSON.stringify({ t: "error", id: 1, message: "boom" }));
   const res = await pending;
   assert.equal(res.status, 502);
-  assert.equal(Buffer.concat(res.chunks).toString(), "boom");
-  assert.equal(res.done, true);
+  assert.equal(Buffer.concat(chunks).toString(), "boom");
+  assert.equal(session.streamCount(), 0);
 });
 
 test("desktop close delivers close to every live stream and clears map", async () => {
@@ -147,6 +158,35 @@ test("replacing the agent closes the old socket with 1012 and clears its streams
   assert.equal(session.agent, fresh);
 });
 
+test("data frames arriving after head still reach onChunk", async () => {
+  const session = waitingSession();
+  const chunks = [];
+  let closed = false;
+  const pending = session.openHttpStream({
+    method: "GET",
+    path: "/stream",
+    headers: {},
+    body: new Uint8Array(0),
+    onChunk: (bytes) => chunks.push(bytes),
+    onClose: () => {
+      closed = true;
+    },
+  });
+  session.agent.emitMessage(
+    JSON.stringify({ t: "head", id: 1, status: 200, headers: {} }),
+  );
+  // 桌面分 tick 流式发送：head → data → close。head 后的数据必须继续透传，
+  // 这是与 Worker ReadableStream 语义对齐的核心场景。
+  session.agent.emitMessage(
+    JSON.stringify({ t: "data", id: 1, b64: base64Of("late"), text: true }),
+  );
+  session.agent.emitMessage(JSON.stringify({ t: "close", id: 1 }));
+  await pending;
+  await new Promise((r) => setImmediate(r)); // onClose is macrotask-deferred
+  assert.equal(Buffer.concat(chunks).toString(), "late");
+  assert.equal(closed, true);
+});
+
 test("head timeout yields 504 and sends close frame", async () => {
   const session = new RelaySession("k", { headTimeoutMs: 20 });
   session.attachAgent(fakeAgent());
@@ -155,10 +195,11 @@ test("head timeout yields 504 and sends close frame", async () => {
     path: "/slow",
     headers: {},
     body: new Uint8Array(0),
+    onClose: () => {},
   });
   const res = await pending;
   assert.equal(res.status, 504);
-  assert.equal(res.done, true);
+  assert.equal(res.timedOut, true);
   assert.equal(session.streamCount(), 0);
   assert.equal(session.agent.last.t, "close");
 });

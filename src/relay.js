@@ -82,51 +82,63 @@ export class RelaySession {
    * {status, headers, chunks, done} so both transports (Worker ReadableStream,
    * Node res) can consume it.
    */
-  openHttpStream({ method, path, headers, body }) {
+  openHttpStream({ method, path, headers, body, onChunk, onClose }) {
     const id = this.nextId++;
     let resolveHead;
     const headReady = new Promise((r) => (resolveHead = r));
-    const chunks = [];
-    const state = { headSeen: false, done: false };
+    let headSeen = false;
     let timer = null;
 
-    const finish = (status, headers, tailBytes, timeoutExpired) => {
-      if (state.headSeen && !timeoutExpired) return; // close/error after head just ends the body
-      state.headSeen = true;
-      state.done = true;
+    const settle = (status, headers, timeoutExpired) => {
+      headSeen = true;
       clearTimeout(timer);
       this.streams.delete(id);
-      resolveHead({ status, headers, tailBytes });
+      // Resolve first; the consumer writes the head, then the macrotask-deferred
+      // onClose ends the body (never an unwritten head → implicit 200).
+      resolveHead({ status, headers, timedOut: timeoutExpired });
+      setImmediate(() => {
+        if (onClose) onClose();
+      });
     };
 
     const deliver = (kind, frame) => {
       if (kind === "head") {
-        if (state.headSeen) return;
-        state.headSeen = true;
+        if (headSeen) return;
+        headSeen = true;
         clearTimeout(timer);
+        this.streams.set(id, dataDeliver); // keep receiving data frames after head
         resolveHead({ status: frame.status ?? 200, headers: frame.headers ?? {} });
         return;
       }
+      if (kind === "close" || kind === "error") {
+        // A stream that died before its head still needs a valid response.
+        if (!headSeen) {
+          const tail = kind === "error" ? new TextEncoder().encode(frame.message ?? "relay stream closed") : new Uint8Array(0);
+          if (onChunk && tail.length) onChunk(tail);
+          settle(502, { "content-type": "text/plain; charset=utf-8" }, false);
+        } else {
+          clearTimeout(timer);
+          this.streams.delete(id);
+          // Head was already resolved; the consumer's await continuation must
+          // write the head before we end the body. The consumer observes the
+          // promise through extra .then layers, so a microtask is not enough —
+          // yield a full macrotask tick.
+          setImmediate(() => {
+            if (onClose) onClose();
+          });
+        }
+      }
+    };
+
+    const dataDeliver = (kind, frame) => {
       if (kind === "data") {
         try {
-          chunks.push(bytesFromBase64(frame.b64));
+          const bytes = bytesFromBase64(frame.b64);
+          if (onChunk) onChunk(bytes);
         } catch {}
         return;
       }
-      if (kind === "close" || kind === "error") {
-        // A close/error after the head simply ends the body; the response is
-        // complete either way.
-        state.done = true;
-        clearTimeout(timer);
-        this.streams.delete(id);
-        if (state.headSeen) return;
-        finish(
-          502,
-          { "content-type": "text/plain; charset=utf-8" },
-          kind === "error" ? new TextEncoder().encode(frame.message ?? "relay stream closed") : new Uint8Array(0),
-          false,
-        );
-      }
+      deliver(kind, frame);
     };
 
     this.streams.set(id, deliver);
@@ -135,16 +147,12 @@ export class RelaySession {
     this.send({ t: "end", id });
 
     timer = setTimeout(() => {
-      if (state.headSeen) return;
-      this.streams.delete(id);
+      if (headSeen) return;
       this.send({ t: "close", id });
-      finish(504, { "content-type": "text/plain; charset=utf-8" }, new Uint8Array(0), true);
+      settle(504, { "content-type": "text/plain; charset=utf-8" }, true);
     }, this.headTimeoutMs);
 
-    return headReady.then(({ status, headers, tailBytes }) => {
-      if (tailBytes && tailBytes.length) chunks.push(tailBytes);
-      return { status, headers, chunks, done: state.done };
-    });
+    return headReady.then(({ status, headers, timedOut }) => ({ status, headers, timedOut }));
   }
 
   /**
@@ -155,21 +163,40 @@ export class RelaySession {
     const id = this.nextId++;
     /** @type {Set<(m: {bytes: Uint8Array, text: boolean}) => void>} */
     const listeners = new Set();
+    /** @type {Set<(info: {code: number, reason: string}) => void>} */
+    const closeListeners = new Set();
+    let closed = false;
     this.streams.set(id, (kind, frame) => {
-      if (kind !== "data") return;
-      try {
-        const bytes = bytesFromBase64(frame.b64);
-        const text = frame.text !== false;
-        for (const cb of listeners) cb({ bytes, text });
-      } catch {}
+      if (kind === "data") {
+        try {
+          const bytes = bytesFromBase64(frame.b64);
+          const text = frame.text !== false;
+          for (const cb of listeners) cb({ bytes, text });
+        } catch {}
+        return;
+      }
+      if (kind === "close" || kind === "error") {
+        // Desktop-side stream death must reach the phone: the original Worker
+        // closed the app socket 1012 here.
+        closed = true;
+        this.streams.delete(id);
+        for (const cb of closeListeners) cb({ code: 1012, reason: "relay stream closed" });
+        closeListeners.clear();
+        listeners.clear();
+      }
     });
     this.send({ t: "open", id, ws: true, path, headers });
     const handle = {
       id,
       onMessage(cb) {
-        listeners.add(cb);
+        if (!closed) listeners.add(cb);
+      },
+      onClose(cb) {
+        if (!closed) closeListeners.add(cb);
+        else cb({ code: 1012, reason: "relay stream closed" });
       },
       close: () => {
+        closed = true;
         this.streams.delete(id);
         this.send({ t: "close", id });
       },

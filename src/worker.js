@@ -63,22 +63,39 @@ export class RelayDO {
       : this.tunnelHttp(request);
   }
 
-  /** HTTP: request head + body in, response head + chunks out. */
+  /** HTTP: request head + body in, response head + chunks streamed out. */
   async tunnelHttp(request) {
     const body = new Uint8Array(await request.arrayBuffer());
     const headers = filterWorkerHeaders(request.headers);
+
+    // Same streaming model as the original Worker: a ReadableStream keeps
+    // accepting data frames after the head until close/error ends it.
+    let streamController;
+    const stream = new ReadableStream({
+      start(c) {
+        streamController = c;
+      },
+    });
 
     const pending = this.session.openHttpStream({
       method: request.method,
       path: new URL(request.url).pathname + new URL(request.url).search,
       headers,
       body,
+      onChunk: (bytes) => {
+        try {
+          streamController?.enqueue(bytes);
+        } catch {}
+      },
+      onClose: () => {
+        try {
+          streamController?.close();
+        } catch {}
+      },
     });
 
-    return pending.then(
-      ({ status, headers, chunks }) =>
-        new Response(chunks.length ? new Blob(chunks) : null, { status, headers }),
-    );
+    const { status, headers: resHeaders } = await pending;
+    return new Response(stream, { status, headers: resHeaders });
   }
 
   /** Live socket (the app's /ws): frames travel both ways, unframed. */
@@ -101,6 +118,11 @@ export class RelayDO {
         // dropped).
         if (text) server.send(new TextDecoder().decode(bytes));
         else server.send(bytes);
+      } catch {}
+    });
+    handle.onClose(({ code, reason }) => {
+      try {
+        server.close(code, reason);
       } catch {}
     });
 
