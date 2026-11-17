@@ -1,0 +1,196 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { RelaySession } from "../src/relay.js";
+
+const base64Of = (s) => Buffer.from(s, "utf8").toString("base64");
+
+function fakeAgent() {
+  const listeners = { message: [], close: [] };
+  return {
+    readyState: "open",
+    sent: [],
+    closeCalls: [],
+    addEventListener(type, fn) {
+      listeners[type].push(fn);
+    },
+    emitMessage(data) {
+      for (const fn of listeners.message) fn({ data });
+    },
+    emitClose() {
+      for (const fn of listeners.close) fn({});
+    },
+    send(frame) {
+      this.sent.push(JSON.parse(frame));
+    },
+    close(code, reason) {
+      this.closeCalls.push({ code, reason });
+      this.readyState = "closed";
+    },
+    get last() {
+      return this.sent[this.sent.length - 1];
+    },
+  };
+}
+
+function waitingSession() {
+  const session = new RelaySession("k");
+  session.attachAgent(fakeAgent());
+  return session;
+}
+
+test("open+body+end serializes onto agent socket in order", () => {
+  const session = waitingSession();
+  const req = {
+    method: "POST",
+    path: "/p?x=1",
+    headers: { "content-type": "text/plain" },
+    body: new TextEncoder().encode("hi"),
+  };
+  const promise = session.openHttpStream(req);
+  const frames = session.agent.sent;
+  assert.deepEqual(frames[0], {
+    t: "open",
+    id: 1,
+    method: "POST",
+    path: "/p?x=1",
+    headers: { "content-type": "text/plain" },
+  });
+  assert.deepEqual(frames[1], { t: "body", id: 1, b64: base64Of("hi") });
+  assert.deepEqual(frames[2], { t: "end", id: 1 });
+  assert.ok(promise instanceof Promise);
+});
+
+test("head+data+close frames resolve the stream response", async () => {
+  const session = waitingSession();
+  const pending = session.openHttpStream({
+    method: "GET",
+    path: "/a",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  const id = 1;
+  session.agent.emitMessage(
+    JSON.stringify({ t: "head", id, status: 200, headers: { "x-a": "b" } }),
+  );
+  session.agent.emitMessage(
+    JSON.stringify({ t: "data", id, b64: base64Of("part"), text: true }),
+  );
+  session.agent.emitMessage(JSON.stringify({ t: "close", id }));
+  const res = await pending;
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["x-a"], "b");
+  assert.equal(Buffer.concat(res.chunks).toString(), "part");
+  assert.equal(res.done, true);
+});
+
+test("empty request body omits the body frame", () => {
+  const session = waitingSession();
+  session.openHttpStream({
+    method: "GET",
+    path: "/a",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  assert.deepEqual(
+    session.agent.sent.map((f) => f.t),
+    ["open", "end"],
+  );
+});
+
+test("stream died before head yields 502 with error message", async () => {
+  const session = waitingSession();
+  const pending = session.openHttpStream({
+    method: "GET",
+    path: "/a",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  session.agent.emitMessage(JSON.stringify({ t: "error", id: 1, message: "boom" }));
+  const res = await pending;
+  assert.equal(res.status, 502);
+  assert.equal(Buffer.concat(res.chunks).toString(), "boom");
+  assert.equal(res.done, true);
+});
+
+test("desktop close delivers close to every live stream and clears map", async () => {
+  const session = waitingSession();
+  const p1 = session.openHttpStream({
+    method: "GET",
+    path: "/1",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  session.agent.emitClose();
+  const res = await p1;
+  assert.equal(res.status, 502);
+  assert.equal(session.streamCount(), 0);
+  assert.equal(session.hasLiveAgent(), false);
+});
+
+test("replacing the agent closes the old socket with 1012 and clears its streams", () => {
+  const session = new RelaySession("k");
+  const old = fakeAgent();
+  session.attachAgent(old);
+  session.openHttpStream({
+    method: "GET",
+    path: "/x",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  assert.equal(session.streamCount(), 1);
+  const fresh = fakeAgent();
+  session.attachAgent(fresh);
+  assert.deepEqual(old.closeCalls, [
+    { code: 1012, reason: "replaced by a new agent connection" },
+  ]);
+  assert.equal(session.streamCount(), 0); // 旧流已随旧连接清算，不得串到新桌面
+  assert.equal(session.agent, fresh);
+});
+
+test("head timeout yields 504 and sends close frame", async () => {
+  const session = new RelaySession("k", { headTimeoutMs: 20 });
+  session.attachAgent(fakeAgent());
+  const pending = session.openHttpStream({
+    method: "GET",
+    path: "/slow",
+    headers: {},
+    body: new Uint8Array(0),
+  });
+  const res = await pending;
+  assert.equal(res.status, 504);
+  assert.equal(res.done, true);
+  assert.equal(session.streamCount(), 0);
+  assert.equal(session.agent.last.t, "close");
+});
+
+test("onAgentFrame ignores malformed JSON without throwing", () => {
+  const session = waitingSession();
+  session.agent.emitMessage("not json at all");
+  session.agent.emitMessage("}\u0000{");
+  assert.equal(session.streamCount(), 0);
+});
+
+test("openSocketStream forwards data frames and close, text normalized", async () => {
+  const session = waitingSession();
+  const handle = session.openSocketStream({ path: "/ws", headers: {} });
+  const seen = [];
+  handle.onMessage((m) => seen.push(m));
+  session.agent.emitMessage(
+    JSON.stringify({ t: "data", id: 1, b64: base64Of("txt"), text: true }),
+  );
+  session.agent.emitMessage(
+    JSON.stringify({ t: "data", id: 1, b64: base64Of("bin"), text: false }),
+  );
+  // text 归一化：缺失视为文本（Worker 语义 frame.text === false 才是二进制）
+  session.agent.emitMessage(
+    JSON.stringify({ t: "data", id: 1, b64: base64Of("dflt") }),
+  );
+  assert.deepEqual(seen, [
+    { bytes: new TextEncoder().encode("txt"), text: true },
+    { bytes: new TextEncoder().encode("bin"), text: false },
+    { bytes: new TextEncoder().encode("dflt"), text: true },
+  ]);
+  handle.close();
+  assert.deepEqual(session.agent.sent.at(-1), { t: "close", id: 1 });
+  assert.equal(session.streamCount(), 0);
+});
