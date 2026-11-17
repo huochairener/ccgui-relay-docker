@@ -6,7 +6,7 @@
 
 **架构：** 把可复用的中继协议（key 鉴权语义、帧编解码、流多路复用）抽到环境无关的 `src/relay.js`；Cloudflare 入口 `src/worker.js` 变成薄壳（Durable Object 仍每 key 一个 `RelayDO`），`src/index.js` 保持为 Worker 入口并 re-export，Wrangler 部署方式不变。Node 入口 `src/server.js` 用 `node:http` + `ws` 装配同一协议：`/agent` 接桌面端 WebSocket，每 key 一个会话对象持单条桌面连接与并发流。
 
-**技术栈：** Node ≥ 18.17（无内置服务端 WebSocket，故用 `ws@9`）、`node:test` + `node:assert`（零测试依赖）、Docker Compose（`node:20-alpine`）、纯 ESM。
+**技术栈：** Node ≥ 18.17（无内置服务端 WebSocket，故用 `ws@8`——registry 无 v9，8.23 为当前最新稳定线）、`node:test` + `node:assert`（零测试依赖）、Docker Compose（`node:20-alpine`）、纯 ESM。
 
 **规格：** docs/superpowers/specs/2026-11-17-node-self-hosted-relay-design.md
 
@@ -394,7 +394,7 @@ test("malformed agent frame does not kill the server", async () => {
 - `/agent`：先做 key 检查（query `key` !== relayKey → 403 纯文本 "forbidden"）；非 Upgrade 请求 → 426 "expected a websocket"；通过后 `wss.handleUpgrade`，`session.attachAgent(ws)`。
 - 手机 ws：`wss.handleUpgrade` 后 `session.openSocketStream({path: req.url, headers: filtered})`，句柄 `onMessage` 把 `{bytes, text}` 回发给手机 ws（text → `ws.send(str)`，binary → `ws.send(bytes)`）；手机 ws 的 `message` 事件（字符串/Buffer）经 base64 发 `{t:"data", id, b64, text}`；手机 ws `close` → 句柄 `close()`。
 - 头过滤（两处共用一个 `filterHeaders` 内部函数）：删 `host`、`connection`、`upgrade`、`sec-websocket-*` 前缀、`cf-` 前缀、`x-forwarded-` 前缀。
-- 依赖安装：`npm install ws@9 --save`（唯一运行时依赖）。
+- 依赖安装：`npm install ws@8 --save`（唯一运行时依赖）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -440,7 +440,7 @@ git commit -m "feat: Node self-hosted relay server speaking the same frame proto
     "test": "node --test test/"
   },
   "engines": { "node": ">=18.17" },
-  "dependencies": { "ws": "^9.0.0" }
+  "dependencies": { "ws": "^8.23.0" }
 }
 ```
 
