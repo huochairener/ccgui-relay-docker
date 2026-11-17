@@ -1,0 +1,9 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      - RELAY_KEY=${RELAY_KEY:?set RELAY_KEY in .env or your shell}
+      - PORT=8787
+    ports:
+      - "${RELAY_PORT:-8787}:8787"
