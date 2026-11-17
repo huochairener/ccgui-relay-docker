@@ -1,5 +1,5 @@
 name = "ccgui-relay"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
 # Durable Object: one instance per relay key owns the desktop's socket.
