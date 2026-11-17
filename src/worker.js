@@ -28,9 +28,11 @@
  */
 
 import { RelaySession } from "./relay.js";
-import { base64FromBytes } from "./base64.js";
 
 export const AGENT_PATH = "/agent";
+
+// A huge request body must not pin DO memory (OOM / CPU burn).
+const MAX_BODY = 8 * 1024 * 1024;
 
 export class RelayDO {
   constructor(state, env) {
@@ -63,9 +65,44 @@ export class RelayDO {
       : this.tunnelHttp(request);
   }
 
+  /**
+   * Read the request body with a hard cap: memory must stay bounded even for a
+   * malicious Content-Length, so count chunks while streaming instead of
+   * arrayBuffer()-ing the whole thing first. Returns null when over MAX_BODY.
+   */
+  async _readBodyWithCap(request) {
+    const reader = request.body.getReader();
+    /** @type {Uint8Array[]} */
+    const parts = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_BODY) {
+        try {
+          await reader.cancel();
+        } catch {}
+        return null; // too large
+      }
+      parts.push(value);
+    }
+    const out = new Uint8Array(size);
+    let off = 0;
+    for (const part of parts) {
+      out.set(part, off);
+      off += part.byteLength;
+    }
+    return out;
+  }
+
   /** HTTP: request head + body in, response head + chunks streamed out. */
   async tunnelHttp(request) {
-    const body = new Uint8Array(await request.arrayBuffer());
+    const body = await this._readBodyWithCap(request);
+    if (body === null) {
+      // A huge request body must not pin DO memory: reject before tunneling.
+      return new Response("request body too large", { status: 413 });
+    }
     const headers = filterWorkerHeaders(request.headers);
 
     // Same streaming model as the original Worker: a ReadableStream keeps
@@ -74,6 +111,11 @@ export class RelayDO {
     const stream = new ReadableStream({
       start(c) {
         streamController = c;
+      },
+      // Phone aborted mid-stream: without cancel the stream stays in
+      // session.streams forever and the desktop keeps pushing data.
+      cancel() {
+        pending?.cancel();
       },
     });
 
@@ -94,7 +136,7 @@ export class RelayDO {
       },
     });
 
-    const { status, headers: resHeaders } = await pending;
+    const { status, headers: resHeaders } = await pending.head;
     return new Response(stream, { status, headers: resHeaders });
   }
 
@@ -129,7 +171,7 @@ export class RelayDO {
     server.addEventListener("message", (event) => {
       const isText = typeof event.data === "string";
       const bytes = isText ? new TextEncoder().encode(event.data) : new Uint8Array(event.data);
-      this.session.send({ t: "data", id: handle.id, b64: base64FromBytes(bytes), text: isText });
+      this.session.sendData(handle.id, bytes, isText);
     });
     server.addEventListener("close", () => handle.close());
 
@@ -139,8 +181,13 @@ export class RelayDO {
 
 const HOP_HEADERS = ["host", "cf-connecting-ip", "cf-ray", "upgrade", "connection"];
 
+// The relay chunks streaming responses itself; a desktop-declared
+// content-length lies about the body (truncation) or conflicts with
+// transfer-encoding (unparseable response). Never forward framing headers.
+const FRAMING_HEADERS = new Set(["content-length", "transfer-encoding", "keep-alive", "trailer"]);
+
 function filterWorkerHeaders(headers, extraDrops = []) {
-  const dropped = new Set([...HOP_HEADERS, ...extraDrops]);
+  const dropped = new Set([...HOP_HEADERS, ...FRAMING_HEADERS, ...extraDrops]);
   const out = {};
   for (const [name, value] of headers) {
     // The hop is TLS-terminated here; the desktop's bridge sees plain HTTP.
@@ -150,6 +197,7 @@ function filterWorkerHeaders(headers, extraDrops = []) {
   return out;
 }
 
+export { RelayDO as Relay };
 export default {
   async fetch(request, env) {
     const key = env.RELAY_KEY;

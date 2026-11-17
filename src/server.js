@@ -15,7 +15,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { RelaySession } from "./relay.js";
-import { base64FromBytes } from "./base64.js";
 
 const SERVER_MESSAGE = "CC GUI 桌面端未连接到中继。请在电脑上打开 CC GUI → 设置 → 远程访问 → 外网访问，启动中转。";
 
@@ -23,7 +22,6 @@ const SERVER_MESSAGE = "CC GUI 桌面端未连接到中继。请在电脑上打�
 function isDroppedHeader(name) {
   return (
     name === "host" ||
-    name === "connection" ||
     name === "upgrade" ||
     name.startsWith("sec-websocket-") ||
     name.startsWith("cf-") ||
@@ -31,31 +29,78 @@ function isDroppedHeader(name) {
   );
 }
 
+/**
+ * Framing headers the hop itself decides: the relay chunks streaming
+ * responses itself, so a desktop-declared content-length lies about the
+ * body (truncation) or conflicts with transfer-encoding (unparseable
+ * response). Never forward them.
+ */
+const FRAMING_HEADERS = new Set(["content-length", "transfer-encoding", "connection", "keep-alive", "trailer", "upgrade"]);
+
 function filterHeaders(rawHeaders) {
   const out = {};
   for (let i = 0; i < rawHeaders.length; i += 2) {
     const name = rawHeaders[i].toLowerCase();
-    if (isDroppedHeader(name)) continue;
+    if (isDroppedHeader(name) || FRAMING_HEADERS.has(name)) continue;
     out[name] = rawHeaders[i + 1];
   }
   return out;
 }
+
+const MAX_BODY = 8 * 1024 * 1024; // 8 MiB cap: a huge Content-Length must not OOM the relay
+
+/**
+ * Attach the error listener every ws needs: ws emits 'error' for protocol
+ * violations (e.g. a frame over maxPayload) and an unlistened 'error' on
+ * an EventEmitter is an uncaught exception — one anonymous frame could
+ * kill the whole process.
+ */
+const killWs = (ws) => {
+  ws.on("error", () => {
+    try {
+      ws.terminate();
+    } catch {}
+  });
+  return ws;
+};
 
 function aggregateBody(req) {
   return new Promise((resolve, reject) => {
     /** @type {Buffer[]} */
     const parts = [];
     let failed = false;
-    req.on("data", (chunk) => parts.push(chunk));
+    let tooLarge = false;
+    let size = 0;
+    const fail = (err) => {
+      if (failed) return;
+      failed = true;
+      reject(err);
+    };
+    req.on("data", (chunk) => {
+      if (failed) return; // oversized/aborted: keep draining, discard
+      size += chunk.length;
+      if (size > MAX_BODY) {
+        // Do not destroy the socket: an early RST makes the client's
+        // in-flight upload die with a socket error before it can read the
+        // 413. Keep draining (discarding) to the end, then reject.
+        tooLarge = true;
+        return;
+      }
+      parts.push(chunk);
+    });
     req.on("end", () => {
-      if (!failed) resolve(Buffer.concat(parts));
+      if (failed) return;
+      if (tooLarge) fail(new Error("request body too large"));
+      else resolve(Buffer.concat(parts));
     });
     // A phone-side cancel (ECONNRESET mid-body) must not become an unhandled
     // rejection: the connection is dead, so just swallow and let the request
     // handler observe `failed` via the close event.
-    req.on("error", () => {
-      failed = true;
-      reject({ aborted: true });
+    req.on("error", () => fail(new Error("request aborted")));
+    // Node does not reliably emit 'error' on a clean client disconnect
+    // mid-body; without this the handler can hang until requestTimeout.
+    req.on("close", () => {
+      if (!req.complete) fail(new Error("client aborted mid-body"));
     });
   });
 }
@@ -75,20 +120,43 @@ export function startServer(options) {
   const session = new RelaySession(relayKey, { headTimeoutMs });
   // Cloudflare caps Worker WebSocket frames at 1 MiB; matching it keeps both
   // entries on one protocol envelope and bounds memory amplification.
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, clientTracking: true, maxPayload: 1024 * 1024 });
+  // Handshake-layer errors must not reach the uncaught-exception handler.
+  wss.on("error", () => {});
+
+  // Dead desktops (network drop without FIN) keep readyState "open" for a
+  // long time; ping/pong reaps them so phones fail fast instead of waiting
+  // out the 30s head timeout on every request.
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        try {
+          ws.terminate();
+        } catch {}
+        continue;
+      }
+      ws.isAlive = false;
+      try {
+        ws.ping();
+      } catch {}
+    }
+  }, 30000);
+  heartbeat.unref?.();
 
   const handle = /** @type {any} */ ({});
 
   const server = http.createServer(async (req, res) => {
     try {
       await handleRequest(req, res);
-    } catch {
-      // Anything that escapes (client abort mid-body, unexpected state) must
-      // not take the process down — the socket is likely dead anyway.
+    } catch (e) {
+      // Anything that escapes (client abort mid-body, oversized body,
+      // unexpected state) must not take the process down — the socket is
+      // likely dead anyway; answer what we still can.
       if (!res.headersSent && res.writable) {
         try {
-          res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-          res.end("relay request aborted");
+          const tooLarge = e instanceof Error && e.message === "request body too large";
+          res.writeHead(tooLarge ? 413 : 502, { "content-type": "text/plain; charset=utf-8" });
+          res.end(tooLarge ? "request body too large" : "relay request aborted");
         } catch {}
       } else {
         try {
@@ -131,7 +199,10 @@ export function startServer(options) {
     const body = await aggregateBody(req);
     let resEnded = false;
     let headWritten = false;
-    /** @type {Uint8Array[]} buffered until writeHead commits the real headers */
+    let paused = false; // res.write backpressure: buffer until "drain"
+    let bufferedBytes = 0;
+    const MAX_BUFFERED = 4 * 1024 * 1024; // cap the backpressure buffer too
+    /** @type {Uint8Array[]} buffered until writeHead commits the real headers / drain fires */
     const pendingChunks = [];
     const closeAfterHead = { value: false };
     const endRes = () => {
@@ -139,16 +210,59 @@ export function startServer(options) {
       resEnded = true;
       res.end();
     };
+    const flushPendingChunks = () => {
+      if (resEnded || headWritten === false || paused) return;
+      for (const chunk of pendingChunks.splice(0)) {
+        const ok = res.write(chunk);
+        if (!ok) {
+          paused = true;
+          res.once("drain", () => {
+            paused = false;
+            flushPendingChunks();
+          });
+          break;
+        }
+      }
+    };
+    let streamHandle = null;
     res.on("close", () => {
+      // Cancel only if the response was still live: endRes() paths (normal
+      // end, timeout, invalid status) have already settled the stream, and a
+      // second close frame for a dead id would just confuse the desktop.
+      const wasLive = !resEnded;
       resEnded = true; // client vanished: stop accepting chunks
+      if (wasLive) streamHandle?.cancel();
     });
     const writeChunk = (bytes) => {
       if (resEnded) return;
-      if (!headWritten) {
-        pendingChunks.push(bytes); // res.write before writeHead sends implicit headers
+      if (!headWritten || paused) {
+        if (bufferedBytes + bytes.length > MAX_BUFFERED) {
+          // Backpressure beyond the cap: fail this response instead of
+          // buffering without bound (slow phone + big file = unbounded heap).
+          if (!headWritten && !resEnded) {
+            headWritten = true;
+            try {
+              res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+            } catch {}
+          }
+          try {
+            streamHandle?.cancel();
+          } catch {}
+          endRes();
+          return;
+        }
+        pendingChunks.push(bytes); // res.write before writeHead sends implicit headers / while paused
+        bufferedBytes += bytes.length;
         return;
       }
-      res.write(bytes);
+      const ok = res.write(bytes);
+      if (!ok && !resEnded) {
+        paused = true;
+        res.once("drain", () => {
+          paused = false;
+          flushPendingChunks();
+        });
+      }
     };
     const pending = session.openHttpStream({
       method: req.method,
@@ -168,9 +282,22 @@ export function startServer(options) {
         endRes();
       },
     });
-    const { status, headers: resHeaders, timedOut } = await pending;
+    streamHandle = pending;
+    const { status, headers: resHeaders, timedOut } = await pending.head;
     if (timedOut) {
-      // 504 head-timeout: onClose already wrote+ended the response.
+      // Head timeout: relay.js deferred onClose as a macrotask, so the await
+      // continuation wins the race and the 504 must be written HERE — the
+      // deferred onClose would otherwise fall back to a bare 502. The relay
+      // has already settled the stream, so no cancel is needed.
+      if (!headWritten && !resEnded) {
+        headWritten = true;
+        try {
+          res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+          res.write("desktop did not respond within the head timeout");
+        } catch {}
+        for (const chunk of pendingChunks.splice(0)) res.write(chunk);
+      }
+      endRes();
       return;
     }
     closeAfterHead.value = resEnded; // close frame beat the await continuation
@@ -189,6 +316,11 @@ export function startServer(options) {
         ) {
           continue; // drop the poisoned header, keep the rest
         }
+        // Framing headers describe THIS hop's transport, not the payload:
+        // the relay chunks streaming responses itself, so a desktop-declared
+        // content-length silently truncates the body and transfer-encoding
+        // conflicts with it. Never forward them.
+        if (FRAMING_HEADERS.has(name)) continue;
         safeHeaders[name] = value;
       }
     }
@@ -202,8 +334,13 @@ export function startServer(options) {
         } catch {}
       }
     }
-    for (const chunk of pendingChunks.splice(0)) writeChunk(chunk);
-    if (closeAfterHead.value || !validStatus) endRes();
+    flushPendingChunks();
+    if (closeAfterHead.value || !validStatus) {
+      // An invalid status means the desktop frame is corrupt: the stream in
+      // session.streams would otherwise keep receiving data forever.
+      if (!validStatus) streamHandle.cancel();
+      endRes();
+    }
     // Otherwise the desktop may still be streaming; res.end() arrives via onClose.
   }
 
@@ -216,6 +353,11 @@ export function startServer(options) {
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        killWs(ws);
+        ws.isAlive = true;
+        ws.on("pong", () => {
+          ws.isAlive = true;
+        });
         session.attachAgent(ws);
         wss.emit("connection", ws, req);
       });
@@ -228,6 +370,11 @@ export function startServer(options) {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      killWs(ws);
+      ws.isAlive = true;
+      ws.on("pong", () => {
+        ws.isAlive = true;
+      });
       const headers = filterHeaders(req.rawHeaders);
       const streamHandle = session.openSocketStream({ path: req.url, headers });
       streamHandle.onMessage(({ bytes, text }) => {
@@ -243,7 +390,7 @@ export function startServer(options) {
       });
       ws.on("message", (data, isBinary) => {
         const bytes = isBinary ? data : new TextEncoder().encode(data.toString());
-        session.send({ t: "data", id: streamHandle.id, b64: base64FromBytes(bytes), text: !isBinary });
+        session.sendData(streamHandle.id, new Uint8Array(bytes), !isBinary);
       });
       ws.on("close", () => streamHandle.close());
     });
@@ -269,6 +416,7 @@ export function startServer(options) {
               ws.close(1012, "server shutting down");
             } catch {}
           });
+          clearInterval(heartbeat);
           server.closeAllConnections?.();
           server.close(() => resolveClose());
         }),

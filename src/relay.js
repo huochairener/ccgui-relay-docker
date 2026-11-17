@@ -20,6 +20,18 @@ import { base64FromBytes, bytesFromBase64 } from "./base64.js";
 
 const DEFAULT_HEAD_TIMEOUT_MS = 30000;
 
+// workerd has no setImmediate (verified: ReferenceError); setTimeout(fn, 0)
+// is the equivalent macrotask on both Node and Workers.
+const defer = (fn) => setTimeout(fn, 0);
+
+// A single agent frame must stay under both transports' 1 MiB maxPayload;
+// base64 inflates by 4/3, so cap the raw payload well below (256 KiB → ~340 KiB b64).
+const MAX_FRAME_BYTES = 256 * 1024;
+
+// The desktop is the only consumer; anonymous phones can open streams without
+// authenticating, so cap concurrency per session.
+const MAX_STREAMS = 256;
+
 export class RelaySession {
   /**
    * @param {string} key
@@ -89,6 +101,19 @@ export class RelaySession {
     let headSeen = false;
     let timer = null;
 
+    // Anonymous phones can open streams without authenticating; cap the
+    // per-session concurrency and answer 503 instead of queueing forever.
+    if (this.streams.size >= MAX_STREAMS) {
+      resolveHead({ status: 503, headers: { "content-type": "text/plain; charset=utf-8" }, timedOut: false });
+      // No open frame was sent and the stream was never registered, but the
+      // consumer still holds the head promise and an open body: defer onClose
+      // exactly like settle() so the response actually terminates.
+      defer(() => {
+        if (onClose) onClose();
+      });
+      return { head: headReady, id, cancel() {} };
+    }
+
     const settle = (status, headers, timeoutExpired) => {
       headSeen = true;
       clearTimeout(timer);
@@ -96,7 +121,7 @@ export class RelaySession {
       // Resolve first; the consumer writes the head, then the macrotask-deferred
       // onClose ends the body (never an unwritten head → implicit 200).
       resolveHead({ status, headers, timedOut: timeoutExpired });
-      setImmediate(() => {
+      defer(() => {
         if (onClose) onClose();
       });
     };
@@ -123,7 +148,7 @@ export class RelaySession {
           // write the head before we end the body. The consumer observes the
           // promise through extra .then layers, so a microtask is not enough —
           // yield a full macrotask tick.
-          setImmediate(() => {
+          defer(() => {
             if (onClose) onClose();
           });
         }
@@ -143,7 +168,18 @@ export class RelaySession {
 
     this.streams.set(id, deliver);
     this.send({ t: "open", id, method, path, headers });
-    if (body && body.length) this.send({ t: "body", id, b64: base64FromBytes(body) });
+    if (body && body.length) {
+      if (body.length > MAX_FRAME_BYTES) {
+        // A single b64 frame of the request body would exceed the 1 MiB
+        // maxPayload on both transports (1009). The desktop client's support
+        // for multiple body frames per id is unverified, so fail loudly
+        // instead of silently corrupting the tunnel.
+        this.send({ t: "error", id, message: "request body too large for relay frame" });
+        settle(413, { "content-type": "text/plain; charset=utf-8" }, false);
+        return { head: headReady, id, cancel() {} };
+      }
+      this.send({ t: "body", id, b64: base64FromBytes(body) });
+    }
     this.send({ t: "end", id });
 
     timer = setTimeout(() => {
@@ -152,7 +188,12 @@ export class RelaySession {
       settle(504, { "content-type": "text/plain; charset=utf-8" }, true);
     }, this.headTimeoutMs);
 
-    return headReady.then(({ status, headers, timedOut }) => ({ status, headers, timedOut }));
+    const cancel = () => {
+      clearTimeout(timer);
+      this.streams.delete(id);
+      this.send({ t: "close", id });
+    };
+    return { head: headReady.then(({ status, headers, timedOut }) => ({ status, headers, timedOut })), id, cancel };
   }
 
   /**
@@ -166,6 +207,18 @@ export class RelaySession {
     /** @type {Set<(info: {code: number, reason: string}) => void>} */
     const closeListeners = new Set();
     let closed = false;
+    // Same per-session cap as HTTP streams; the phone path is unauthenticated.
+    if (this.streams.size >= MAX_STREAMS) {
+      const rejectHandle = {
+        id,
+        onMessage() {},
+        onClose(cb) {
+          cb({ code: 1013, reason: "too many relay streams" });
+        },
+        close() {},
+      };
+      return rejectHandle;
+    }
     this.streams.set(id, (kind, frame) => {
       if (kind === "data") {
         try {
@@ -204,8 +257,28 @@ export class RelaySession {
     return handle;
   }
 
+  /**
+   * Send a data frame only if its base64 form fits the 1 MiB maxPayload on
+   * both transports (256 KiB raw → ~340 KiB b64). Oversized data frames are
+   * dropped and an error frame is delivered instead — the desktop's support
+   * for multi-frame payloads is unverified, so never send one that cannot
+   * arrive.
+   */
+  sendData(id, bytes, text) {
+    if (bytes.length > MAX_FRAME_BYTES) {
+      this.send({ t: "error", id, message: "payload too large for relay frame" });
+      return;
+    }
+    this.send({ t: "data", id, b64: base64FromBytes(bytes), text });
+  }
+
   send(frame) {
-    if (this.hasLiveAgent()) this.agent.send(JSON.stringify(frame));
+    if (!this.hasLiveAgent()) return;
+    // agent.send throws on Workers' server socket once it is closing/closed —
+    // an unhandled throw here would take down the whole relay.
+    try {
+      this.agent.send(JSON.stringify(frame));
+    } catch {}
   }
 
   onAgentFrame(raw) {

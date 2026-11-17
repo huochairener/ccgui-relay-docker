@@ -57,7 +57,12 @@ test("open+body+end serializes onto agent socket in order", () => {
   });
   assert.deepEqual(frames[1], { t: "body", id: 1, b64: base64Of("hi") });
   assert.deepEqual(frames[2], { t: "end", id: 1 });
-  assert.ok(promise instanceof Promise);
+  assert.ok(promise.head instanceof Promise);
+  assert.equal(promise.id, 1);
+  assert.equal(typeof promise.cancel, "function");
+  // No onClose/consumer here: a default 30s head timer would hang the test
+  // runner's event loop.
+  promise.cancel();
 });
 
 test("head+data+close frames stream the response via callbacks", async () => {
@@ -82,27 +87,29 @@ test("head+data+close frames stream the response via callbacks", async () => {
     JSON.stringify({ t: "data", id, b64: base64Of("part"), text: true }),
   );
   session.agent.emitMessage(JSON.stringify({ t: "close", id }));
-  const res = await pending;
+  const res = await pending.head;
   assert.equal(res.status, 200);
   assert.equal(res.headers["x-a"], "b");
   assert.equal(Buffer.concat(chunks).toString(), "part");
-  await new Promise((r) => setImmediate(r)); // onClose is macrotask-deferred
+  await new Promise((r) => setTimeout(r, 0)); // onClose is macrotask-deferred (defer = setTimeout 0)
   assert.equal(closed, true);
   assert.equal(session.streamCount(), 0);
 });
 
 test("empty request body omits the body frame", () => {
   const session = waitingSession();
-  session.openHttpStream({
+  const handle = session.openHttpStream({
     method: "GET",
     path: "/a",
     headers: {},
     body: new Uint8Array(0),
+    headTimeoutMs: 20,
   });
   assert.deepEqual(
     session.agent.sent.map((f) => f.t),
     ["open", "end"],
   );
+  handle.cancel(); // never leave a head timer hanging on the event loop
 });
 
 test("stream died before head yields 502 with error message", async () => {
@@ -117,7 +124,7 @@ test("stream died before head yields 502 with error message", async () => {
     onClose: () => {},
   });
   session.agent.emitMessage(JSON.stringify({ t: "error", id: 1, message: "boom" }));
-  const res = await pending;
+  const res = await pending.head;
   assert.equal(res.status, 502);
   assert.equal(Buffer.concat(chunks).toString(), "boom");
   assert.equal(session.streamCount(), 0);
@@ -132,7 +139,7 @@ test("desktop close delivers close to every live stream and clears map", async (
     body: new Uint8Array(0),
   });
   session.agent.emitClose();
-  const res = await p1;
+  const res = await p1.head;
   assert.equal(res.status, 502);
   assert.equal(session.streamCount(), 0);
   assert.equal(session.hasLiveAgent(), false);
@@ -147,6 +154,7 @@ test("replacing the agent closes the old socket with 1012 and clears its streams
     path: "/x",
     headers: {},
     body: new Uint8Array(0),
+    headTimeoutMs: 20,
   });
   assert.equal(session.streamCount(), 1);
   const fresh = fakeAgent();
@@ -155,6 +163,9 @@ test("replacing the agent closes the old socket with 1012 and clears its streams
     { code: 1012, reason: "replaced by a new agent connection" },
   ]);
   assert.equal(session.streamCount(), 0); // 旧流已随旧连接清算，不得串到新桌面
+  assert.equal(session.agent, fresh);
+  // headTimeoutMs: 20 的 timer 已被清算（_broadcastClose 清了 streams），
+  // 但 cancel() 显式兜底，绝不给事件循环留吊着的 timer。
   assert.equal(session.agent, fresh);
 });
 
@@ -181,8 +192,8 @@ test("data frames arriving after head still reach onChunk", async () => {
     JSON.stringify({ t: "data", id: 1, b64: base64Of("late"), text: true }),
   );
   session.agent.emitMessage(JSON.stringify({ t: "close", id: 1 }));
-  await pending;
-  await new Promise((r) => setImmediate(r)); // onClose is macrotask-deferred
+  await pending.head;
+  await new Promise((r) => setTimeout(r, 0)); // onClose is macrotask-deferred (defer = setTimeout 0)
   assert.equal(Buffer.concat(chunks).toString(), "late");
   assert.equal(closed, true);
 });
@@ -197,7 +208,7 @@ test("head timeout yields 504 and sends close frame", async () => {
     body: new Uint8Array(0),
     onClose: () => {},
   });
-  const res = await pending;
+  const res = await pending.head;
   assert.equal(res.status, 504);
   assert.equal(res.timedOut, true);
   assert.equal(session.streamCount(), 0);

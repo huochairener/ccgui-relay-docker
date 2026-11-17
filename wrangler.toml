@@ -12,6 +12,10 @@ tag = "v1"
 new_sqlite_classes = ["Relay"]
 
 [vars]
-# 与 CC GUI「中转密钥」保持一致 / must match the key field in CC GUI.
-# 部署后也可在控制台 Variables 里修改，改完无需重新部署。
-RELAY_KEY = "J123ASDCVX7489DQWQTDVQTTMDFHR"
+# RELAY_KEY 不再写在这里：它是桌面端与中继之间的唯一鉴权凭据，明文进 git
+# 等于发给所有能读仓库的人（且已进入历史，请轮换）。
+# 部署时改用密钥命令，读取方式不变（Worker 代码仍读 env.RELAY_KEY）：
+#   npx wrangler secret put RELAY_KEY
+# RELAY_KEY is no longer stored here: it is the relay's only auth secret and
+# must never be committed. Set it with `npx wrangler secret put RELAY_KEY`;
+# the code keeps reading env.RELAY_KEY, so nothing else changes.

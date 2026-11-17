@@ -11,12 +11,14 @@ client needs no changes.
 1. 装 Node ≥ 16.17（只为拿 npx wrangler）。
    Install Node ≥ 16.17 (only to get npx wrangler).
 2. npx wrangler login      # 浏览器授权一次 / authorize once in the browser
-3. npx wrangler deploy     # 输出 https://ccgui-relay.<你的子域>.workers.dev
-4. CC GUI → 设置 → 远程访问 → 外网访问：
-   中转地址 = 上一步的 URL，中转密钥 = 本包 wrangler.toml 里的 RELAY_KEY。
+3. npx wrangler secret put RELAY_KEY   # 按提示粘贴密钥 / paste the key when prompted
+   （密钥不进 wrangler.toml / the key never lives in wrangler.toml）
+4. npx wrangler deploy     # 输出 https://ccgui-relay.<你的子域>.workers.dev
+5. CC GUI → 设置 → 远程访问 → 外网访问：
+   中转地址 = 上一步的 URL，中转密钥 = 你在 secret 里设置的 RELAY_KEY。
    CC GUI → Settings → Remote access → Outbound: relay URL = the URL above,
-   relay key = RELAY_KEY from this pack's wrangler.toml.
-5. 点「连接中转」；手机打开该 URL → 授权页 → 输入 CC GUI 上的 8 位配对密钥。
+   relay key = the RELAY_KEY you set via wrangler secret.
+6. 点「连接中转」；手机打开该 URL → 授权页 → 输入 CC GUI 上的 8 位配对密钥。
    Click Connect relay; open that URL on the phone → authorization page →
    enter the 8-character pairing key shown in CC GUI.
 

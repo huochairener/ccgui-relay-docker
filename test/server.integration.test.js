@@ -238,7 +238,6 @@ test("malformed agent frames do not kill the server", async () => {
 test("startServer without a relayKey throws", () => {
   assert.throws(() => startServer({ port: 0 }), /RELAY_KEY/);
 });
-
 test("startServer with a non-numeric port throws instead of falling back", () => {
   assert.throws(() => startServer({ relayKey: KEY, port: "not-a-port" }), /PORT/);
 });
@@ -249,4 +248,121 @@ test("parsePort rejects non-numeric PORT for main()", async () => {
   assert.throws(() => parsePort(""), /PORT/);
   assert.equal(parsePort("8787"), 8787);
   assert.equal(parsePort("0"), 0);
+});
+
+// --- review regression tests ---------------------------------------------
+
+test("oversized ws frame from anonymous phone does not crash the server", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 1000 });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+  const app = new WebSocket(`ws://127.0.0.1:${port}/ws?token=t`);
+  app.__frames = makeFrameQueue(app);
+  await onceOpen(app);
+  app.on("error", () => {}); // the 1009 close is expected here
+  app.send(Buffer.alloc(2 * 1024 * 1024)); // over maxPayload: must close, not crash
+  await new Promise((r) => setTimeout(r, 150));
+  // The terminated app socket emits close → a close(id) frame for the dead
+  // stream also lands on the agent socket; only the fresh /still-up open
+  // (its own id) is the round-two stream.
+  const phone = fetch(`http://127.0.0.1:${port}/still-up`, { method: "GET" });
+  let open = null;
+  for (let i = 0; i < 6 && !open; i++) {
+    const f = await nextFrame(agent);
+    if (f.t === "open" && String(f.path).includes("/still-up")) open = f;
+  }
+  assert.ok(open, "expected the /still-up open frame");
+  for (let i = 0; i < 3; i++) {
+    const f = await nextFrame(agent);
+    if (f.t === "end") break;
+  }
+  agent.send(JSON.stringify({ t: "head", id: open.id, status: 200, headers: {} }));
+  agent.send(JSON.stringify({ t: "close", id: open.id }));
+  assert.equal((await phone).status, 200);
+  app.close();
+  agent.close();
+  await close();
+});
+
+test("desktop framing headers are stripped from the response head", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 2000 });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+  const phone = fetch(`http://127.0.0.1:${port}/liar`, { method: "GET" });
+  const open = await nextFrame(agent);
+  agent.send(
+    JSON.stringify({
+      t: "head",
+      id: open.id,
+      status: 200,
+      headers: { "content-length": "2", "content-type": "text/plain", "transfer-encoding": "chunked", "x-keep": "yes" },
+    }),
+  );
+  agent.send(JSON.stringify({ t: "data", id: open.id, b64: Buffer.from("0123456789").toString("base64"), text: true }));
+  agent.send(JSON.stringify({ t: "close", id: open.id }));
+  const res = await phone;
+  assert.equal(res.status, 200);
+  // The lying content-length must not truncate the body; TE/CL must not coexist.
+  assert.equal(await res.text(), "0123456789");
+  assert.equal(res.headers.get("x-keep"), "yes");
+  assert.equal(res.headers.get("content-length"), null);
+  agent.close();
+  await close();
+});
+
+test("head timeout answers 504 with a message, not a bare 502", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 100 });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+  const phone = fetch(`http://127.0.0.1:${port}/slow`, { method: "GET" });
+  await nextFrame(agent); // open; desktop never answers
+  const res = await phone;
+  assert.equal(res.status, 504);
+  assert.ok((await res.text()).includes("timeout"));
+  agent.close();
+  await close();
+});
+
+test("phone abort mid-stream cancels the relay stream", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 30000 });
+  await handle.ready();
+  const { port, close, session } = handle;
+  const agent = await attachedAgent(port);
+  agent.on("message", (d) => {
+    const f = JSON.parse(d.toString());
+    if (f.t === "open") {
+      agent.send(JSON.stringify({ t: "head", id: f.id, status: 200, headers: { "content-type": "text/plain" } }));
+    }
+  });
+  const ac = new AbortController();
+  fetch(`http://127.0.0.1:${port}/stream`, { signal: ac.signal }).catch(() => {});
+  await nextFrame(agent); // open
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(session.streamCount(), 1);
+  ac.abort();
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(session.streamCount(), 0); // must not leak
+  // Desktop saw the close frame for the aborted stream (after open/body?/end).
+  let closeFrame;
+  for (let i = 0; i < 4; i++) {
+    closeFrame = await agent.__frames.next().then(({ data }) => JSON.parse(data.toString()));
+    if (closeFrame.t === "close") break;
+  }
+  assert.equal(closeFrame.t, "close");
+  agent.close();
+  await close();
+});
+
+test("request body over MAX_BODY answers 413", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 1000 });
+  await handle.ready();
+  const { port, close } = handle;
+  await attachedAgent(port);
+  // 9 MiB > 8 MiB cap
+  const res = await fetch(`http://127.0.0.1:${port}/upload`, { method: "POST", body: Buffer.alloc(9 * 1024 * 1024) });
+  assert.equal(res.status, 413);
+  await close();
 });

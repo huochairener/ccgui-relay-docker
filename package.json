@@ -6,7 +6,7 @@
   "description": "CC GUI relay: self-hosted Node entry + Cloudflare Worker",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18.17"
