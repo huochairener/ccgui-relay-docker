@@ -40,7 +40,10 @@ export class RelaySession {
   }
 
   hasLiveAgent() {
-    return this.agent !== null && this.agent.readyState === "open";
+    // Workers' server sockets report readyState "open" (string); the `ws`
+    // package uses the numeric constant WebSocket.OPEN === 1.
+    const rs = this.agent?.readyState;
+    return rs === "open" || rs === 1;
   }
 
   streamCount() {
@@ -162,6 +165,7 @@ export class RelaySession {
     });
     this.send({ t: "open", id, ws: true, path, headers });
     const handle = {
+      id,
       onMessage(cb) {
         listeners.add(cb);
       },

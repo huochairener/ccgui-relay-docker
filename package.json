@@ -1,4 +1,16 @@
 {
+  "name": "ccgui-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CC GUI relay: self-hosted Node entry + Cloudflare Worker",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
   "dependencies": {
     "ws": "^8.23.0"
   }
