@@ -57,11 +57,29 @@ function wsProbe(url, timeoutMs = 15000) {
 }
 
 async function main() {
-  // 1. plain HTTP through the edge
+  // 0. health check: identifies which hop replies (relay vs edge) and needs
+  //    no desktop, so it works even while the app is broken.
   let t0 = Date.now();
   try {
+    const r = await fetch(base + "/healthz");
+    const body = (await r.text()).slice(0, 80).replace(/\n/g, " ");
+    console.log(`[0] GET /healthz     -> ${r.status} in ${ms(Date.now() - t0)} : ${body}`);
+  } catch (e) {
+    console.log(`[0] GET /healthz     -> FAIL ${ms(Date.now() - t0)}: ${e.message} ${e.cause?.code ?? ""}`);
+  }
+
+  // 1. plain HTTP through the edge
+  t0 = Date.now();
+  try {
     const r = await fetch(base + "/");
-    console.log(`[1] GET /            -> ${r.status} in ${ms(Date.now() - t0)} : ${(await r.text()).slice(0, 60).replace(/\n/g, " ")}`);
+    const body = (await r.text()).slice(0, 60).replace(/\n/g, " ");
+    // Our relay never returns HTML itself: it returns plain text ("forbidden",
+    // the Chinese "desktop not connected" message, or a desktop-provided
+    // body). So an HTML body came from the DESKTOP app (the phone page) or
+    // from an EDGE security page — the two are told apart by markers.
+    const waf = /edgeone|edgeone|阿里云|腾讯云|安全防护|waf|blocked|access denied|安全网关|aliyun/i.test(body);
+    const who = waf ? "EDGE security page" : body.startsWith("<") ? "desktop app page (HTML)" : "relay plain text";
+    console.log(`[1] GET /            -> ${r.status} in ${ms(Date.now() - t0)} [${who}] : ${body}`);
   } catch (e) {
     console.log(`[1] GET /            -> FAIL ${ms(Date.now() - t0)}: ${e.message} ${e.cause?.code ?? ""}`);
   }
@@ -75,10 +93,19 @@ async function main() {
     console.log(`[2] GET /agent?wrong -> FAIL ${ms(Date.now() - t0)}: ${e.message} ${e.cause?.code ?? ""}`);
   }
 
-  // 3. WebSocket upgrade with the real key — the critical one.
-  // The handshake itself is plain HTTP, so ws:// -> http:// for the request.
+  // 3. WS  /ws — the phone's control socket. This needs NO desktop and NO
+  //    key, so it is safe to run: it never disturbs the running desktop.
+  //    A plain-text 503 means the edge forwarded the Upgrade request to the
+  //    origin intact; an HTML page or 426 means the edge broke the upgrade.
+  console.log(`[3] WS  /ws          -> ${await wsProbe(`${base.replace(/^http/, "ws")}/ws`)}`);
+
+  // 4. WS  /agent with the REAL key — the desktop's own long connection.
+  //    NOTE: this replaces the running desktop's socket (the relay keeps one
+  //    desktop per key), so the desktop will reconnect right after. Only run
+  //    it when you can afford that, and expect the phone to fail while the
+  //    desktop is reconnecting.
   const wsUrl = `${base.replace(/^http/, "ws")}/agent?key=${encodeURIComponent(key)}`;
-  console.log(`[3] WS  /agent       -> ${await wsProbe(wsUrl)}`);
+  console.log(`[4] WS  /agent       -> ${await wsProbe(wsUrl)}`);
   process.exit(0);
 }
 main();

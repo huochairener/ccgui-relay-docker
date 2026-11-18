@@ -100,6 +100,49 @@ test("phone request without a desktop answers 503 with the Chinese message", asy
   await close();
 });
 
+test("/healthz answers without a desktop and reports its state", async () => {
+  const handle = startServer({ relayKey: KEY, port: 0 });
+  await handle.ready();
+  const { port, close } = handle;
+  // No desktop attached: the health check must still answer, so it can tell
+  // "the edge never reached the origin" apart from "the desktop is offline".
+  let res = await fetch(`http://127.0.0.1:${port}/healthz`);
+  assert.equal(res.status, 200);
+  let body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.desktop, false);
+
+  const agent = await attachedAgent(port);
+  res = await fetch(`http://127.0.0.1:${port}/healthz`);
+  body = await res.json();
+  assert.equal(body.desktop, true);
+  agent.close();
+  await close();
+});
+
+test("protocol events reach the transport logger", async () => {
+  // A head timeout must be visible in the log: on a remote server behind an
+  // edge proxy, "the phone page never starts" is otherwise untraceable.
+  const lines = [];
+  const logger = {
+    error: (m, e) => lines.push(["error", m, e]),
+    warn: (m, e) => lines.push(["warn", m, e]),
+    info: (m, e) => lines.push(["info", m, e]),
+    debug: (m, e) => lines.push(["debug", m, e]),
+  };
+  const handle = startServer({ relayKey: KEY, port: 0, headTimeoutMs: 100, logger });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+  const res = await fetch(`http://127.0.0.1:${port}/slow`);
+  assert.equal(res.status, 504);
+  const timeoutLine = lines.find(([lvl, msg]) => lvl === "warn" && msg.includes("head-timeout"));
+  assert.ok(timeoutLine, "head timeout must be logged");
+  assert.equal(timeoutLine[2].path, "/slow");
+  agent.close();
+  await close();
+});
+
 test("HTTP round-trip through the desktop socket", async () => {
   const handle = startServer({ relayKey: KEY, port: 0 });
   await handle.ready();

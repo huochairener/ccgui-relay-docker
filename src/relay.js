@@ -35,11 +35,15 @@ const MAX_STREAMS = 256;
 export class RelaySession {
   /**
    * @param {string} key
-   * @param {{ headTimeoutMs?: number }} [options] — headTimeoutMs injectable for tests.
+   * @param {{ headTimeoutMs?: number, onEvent?: (event: string, data: any) => void }} [options]
+   *   headTimeoutMs injectable for tests; onEvent reports protocol-level
+   *   events the transports can't see on their own (head timeouts, frames
+   *   the desktop refused, streams the desktop killed).
    */
   constructor(key, options = {}) {
     this.key = key;
     this.headTimeoutMs = options.headTimeoutMs ?? DEFAULT_HEAD_TIMEOUT_MS;
+    this.onEvent = typeof options.onEvent === "function" ? options.onEvent : null;
     /** @type {{ readyState: string, send: (s: string) => void, close: (c: number, r: string) => void } | null} */
     this.agent = null;
     this.nextId = 1;
@@ -138,12 +142,14 @@ export class RelaySession {
       if (kind === "close" || kind === "error") {
         // A stream that died before its head still needs a valid response.
         if (!headSeen) {
+          this._emit(kind === "error" ? "stream-error" : "stream-closed-before-head", { id, method, path, message: frame.message });
           const tail = kind === "error" ? new TextEncoder().encode(frame.message ?? "relay stream closed") : new Uint8Array(0);
           if (onChunk && tail.length) onChunk(tail);
           settle(502, { "content-type": "text/plain; charset=utf-8" }, false);
         } else {
           clearTimeout(timer);
           this.streams.delete(id);
+          this._emit(kind === "error" ? "stream-error" : "stream-closed", { id, method, path, message: frame.message });
           // Head was already resolved; the consumer's await continuation must
           // write the head before we end the body. The consumer observes the
           // promise through extra .then layers, so a microtask is not enough —
@@ -184,6 +190,7 @@ export class RelaySession {
 
     timer = setTimeout(() => {
       if (headSeen) return;
+      this._emit("head-timeout", { id, method, path });
       this.send({ t: "close", id });
       settle(504, { "content-type": "text/plain; charset=utf-8" }, true);
     }, this.headTimeoutMs);
@@ -266,10 +273,22 @@ export class RelaySession {
    */
   sendData(id, bytes, text) {
     if (bytes.length > MAX_FRAME_BYTES) {
+      this._emit("payload-too-large", { id, bytes: bytes.length, limit: MAX_FRAME_BYTES });
       this.send({ t: "error", id, message: "payload too large for relay frame" });
       return;
     }
     this.send({ t: "data", id, b64: base64FromBytes(bytes), text });
+  }
+
+  /**
+   * Report a protocol-level event to the transport's logger (if any).
+   * Never throws: a broken logger must not take the relay down.
+   */
+  _emit(event, data) {
+    if (!this.onEvent) return;
+    try {
+      this.onEvent(event, data);
+    } catch {}
   }
 
   send(frame) {

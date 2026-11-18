@@ -18,6 +18,32 @@ import { RelaySession } from "./relay.js";
 
 const SERVER_MESSAGE = "CC GUI 桌面端未连接到中继。请在电脑上打开 CC GUI → 设置 → 远程访问 → 外网访问，启动中转。";
 
+/**
+ * 结构化日志（stdout）。
+ *
+ * 这个中继通常部署在远程服务器上、前面还隔着 EO/ESA 这类边缘层。要区分
+ * 「边缘请求根本没到源站」「桌面端没连上」「桌面端连上了但不回话」，
+ * 唯一的办法就是源站留下日志行。级别用 RELAY_LOG 控制：
+ * error | warn | info | debug，默认 info。
+ */
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+
+function createLogger(levelName) {
+  const level = LOG_LEVELS[String(levelName ?? "").toLowerCase()] ?? LOG_LEVELS.info;
+  const emit = (lvl, msg, extra) => {
+    if (LOG_LEVELS[lvl] > level) return;
+    const line = `${new Date().toISOString()} [${lvl.toUpperCase()}] ${msg}`;
+    if (extra === undefined) console.log(line);
+    else console.log(line, typeof extra === "string" ? extra : JSON.stringify(extra));
+  };
+  return {
+    error: (m, e) => emit("error", m, e),
+    warn: (m, e) => emit("warn", m, e),
+    info: (m, e) => emit("info", m, e),
+    debug: (m, e) => emit("debug", m, e),
+  };
+}
+
 /** Headers the relay strips before forwarding (Worker equivalents + edge-origin noise). */
 function isDroppedHeader(name) {
   return (
@@ -116,8 +142,16 @@ export function startServer(options) {
   const port = parsePort(options.port ?? 0);
   const host = options.host ?? "0.0.0.0";
   const headTimeoutMs = options.headTimeoutMs ?? 30000;
+  const log = options.logger ?? createLogger(options.logLevel ?? process.env.RELAY_LOG ?? "info");
 
-  const session = new RelaySession(relayKey, { headTimeoutMs });
+  const session = new RelaySession(relayKey, {
+    headTimeoutMs,
+    // Protocol-level events the transports can't see on their own: a frame
+    // the desktop could not accept, a head that timed out, a stream the
+    // desktop killed. These are the lines that explain a phone page that
+    // refuses to start.
+    onEvent: (event, data) => log.warn(`relay ${event}`, data),
+  });
   // Cloudflare caps Worker WebSocket frames at 1 MiB; matching it keeps both
   // entries on one protocol envelope and bounds memory amplification.
   const wss = new WebSocketServer({ noServer: true, clientTracking: true, maxPayload: 1024 * 1024 });
@@ -169,9 +203,26 @@ export function startServer(options) {
   async function handleRequest(req, res) {
     const url = new URL(req.url, "http://relay.local");
 
+    // 0. Health check: answers without a desktop, so it identifies WHICH
+    //    hop replied (the relay, or an edge in front of it) and works as an
+    //    edge health-check target.
+    if (url.pathname === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          desktop: session.hasLiveAgent(),
+          streams: session.streamCount(),
+          uptime: Math.round(process.uptime()),
+        }),
+      );
+      return;
+    }
+
     // 1. The desktop's own connection: /agent?key=<secret>.
     if (url.pathname === "/agent") {
       if (url.searchParams.get("key") !== relayKey) {
+        log.warn("agent rejected: wrong key", { ip: req.socket.remoteAddress });
         res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
         res.end("forbidden");
         return;
@@ -188,6 +239,7 @@ export function startServer(options) {
     //    desktop's bridge decides (token + per-device approval), so this relay
     //    holds no policy beyond "is there a desktop attached".
     if (!session.hasLiveAgent()) {
+      log.warn("phone request without a live desktop", { method: req.method, path: url.pathname, ip: req.socket.remoteAddress });
       res.writeHead(503, { "content-type": "text/plain; charset=utf-8" });
       res.end(SERVER_MESSAGE);
       return;
@@ -284,6 +336,15 @@ export function startServer(options) {
     });
     streamHandle = pending;
     const { status, headers: resHeaders, timedOut } = await pending.head;
+    // Log the query KEYS (never the values: they carry the app's token) so a
+    // stripped or rewritten URL by the edge layer is visible.
+    log.info("phone request", {
+      method: req.method,
+      path: url.pathname,
+      query: [...url.searchParams.keys()],
+      status,
+      timedOut: !!timedOut,
+    });
     if (timedOut) {
       // Head timeout: relay.js deferred onClose as a macrotask, so the await
       // continuation wins the race and the 504 must be written HERE — the
@@ -358,13 +419,18 @@ export function startServer(options) {
         ws.on("pong", () => {
           ws.isAlive = true;
         });
+        log.info("desktop connected", { ip: req.socket.remoteAddress, url: req.url });
         session.attachAgent(ws);
+        ws.on("close", (code, reason) => {
+          log.warn("desktop disconnected", { code, reason: reason?.toString?.() ?? "" });
+        });
         wss.emit("connection", ws, req);
       });
       return;
     }
     // Phone WebSocket tunnel: same contract as the Worker's tunnelSocket.
     if (!session.hasLiveAgent()) {
+      log.warn("phone websocket without a live desktop", { path: url.pathname, ip: req.socket.remoteAddress });
       socket.write("HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\nconnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -376,6 +442,11 @@ export function startServer(options) {
         ws.isAlive = true;
       });
       const headers = filterHeaders(req.rawHeaders);
+      log.info("phone websocket opened", {
+        path: url.pathname,
+        query: [...url.searchParams.keys()],
+        ip: req.socket.remoteAddress,
+      });
       const streamHandle = session.openSocketStream({ path: req.url, headers });
       streamHandle.onMessage(({ bytes, text }) => {
         try {
@@ -384,6 +455,7 @@ export function startServer(options) {
         } catch {}
       });
       streamHandle.onClose(({ code, reason }) => {
+        log.warn("phone websocket closed", { code, reason });
         try {
           ws.close(code, reason);
         } catch {}
@@ -392,7 +464,10 @@ export function startServer(options) {
         const bytes = isBinary ? data : new TextEncoder().encode(data.toString());
         session.sendData(streamHandle.id, new Uint8Array(bytes), !isBinary);
       });
-      ws.on("close", () => streamHandle.close());
+      ws.on("close", (code, reason) => {
+        log.info("phone websocket ended", { code, reason: reason?.toString?.() ?? "" });
+        streamHandle.close();
+      });
     });
   });
 
