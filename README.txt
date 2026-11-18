@@ -54,6 +54,32 @@ Docker Compose（推荐 / recommended）：
 CC GUI 填写（Fill in CC GUI）：中转地址 = 上述 URL，中转密钥 = RELAY_KEY。
 Relay URL = the URL above; relay key = RELAY_KEY.
 
+【排障 / Troubleshooting】
+症状：手机端能打开页面，但 CC GUI 提示「启动失败」，点重新加载也没用。
+  Symptom: the phone page opens but CC GUI reports a startup failure.
+
+先在服务器上跑探针（零依赖，不需要 npm install）：
+  First run the probe on the server (zero dependencies, no npm install needed):
+    RELAY_KEY=<你的密钥> node probe.js https://<你的边缘域名>
+  输出的每一行对应一跳：
+    [0] /healthz    → 边缘能否把请求送到源站；返回 JSON 就说明到了
+    [1] GET /       → 桌面端应用是否在线（HTML 是桌面端的页面）
+    [2] /agent?wrong → 必须是我们的 403 forbidden（证明源站在应答）
+    [3] WS /ws      → 手机的 WebSocket 升级是否穿过边缘（必须 UPGRADED）
+    [4] WS /agent   → 桌面端长连接升级（会顶掉当前桌面端连接，谨慎跑）
+
+再看中继日志（容器：docker compose logs -f；裸机：日志在 stdout）：
+  Then read the relay log (docker compose logs -f, or stdout for bare metal):
+    级别用 RELAY_LOG 控制：error | warn | info | debug（默认 info）。
+    日志会告诉你到底是哪一环断了：桌面端没连上、head 超时、流被桌面端
+    关掉、还是请求根本没到源站。
+
+常见边缘层配置要点：
+  - 回源必须启用 WebSocket（EO 规则引擎 / ESA 回源配置），否则 [3]/[4] 失败。
+  - 关闭响应缓冲 / 智能压缩，保留流式（chunked）响应。
+  - 空闲连接超时 ≥ 60 秒（中继每 30 秒一次心跳，过短会周期性掐断长连接）。
+  - 用 /healthz 作为边缘健康检查目标，它不依赖桌面端在线。
+
 【包里有什么 / What's inside】
 - src/relay.js     中继协议核心（帧编解码、流多路复用）/ protocol core (framing, stream multiplexing)
 - src/worker.js    Cloudflare Worker 入口（RelayDO + fetch handler）/ Worker entry (RelayDO + fetch handler)
