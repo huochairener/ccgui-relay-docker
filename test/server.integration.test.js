@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { WebSocket } from "ws";
 import { startServer } from "../src/server.js";
 
@@ -139,6 +140,89 @@ test("protocol events reach the transport logger", async () => {
   const timeoutLine = lines.find(([lvl, msg]) => lvl === "warn" && msg.includes("head-timeout"));
   assert.ok(timeoutLine, "head timeout must be logged");
   assert.equal(timeoutLine[2].path, "/slow");
+  agent.close();
+  await close();
+});
+
+test("large streamed response survives client backpressure byte-for-byte", async () => {
+  // Regression for the truncation bugs: a slow phone (edge RTT) reading a
+  // multi-hundred-KiB JS bundle forces res.write backpressure while the
+  // desktop streams chunks + close. The old code dropped buffered chunks
+  // (flush spliced-then-broke; endRes ignored pendingChunks) and the phone
+  // got a truncated file — which the browser reports as
+  // "SyntaxError: Invalid or unexpected token" in the app's bootstrap chunk.
+  const handle = startServer({ relayKey: KEY, port: 0, logLevel: "error" });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+
+  const chunkCount = 6;
+  const chunkSize = 512 * 1024; // 3 MiB total: beyond any socket buffer, under the 4 MiB cap
+  const expected = Buffer.alloc(chunkCount * chunkSize);
+  for (let i = 0; i < expected.length; i++) expected[i] = (i * 7 + 11) % 256;
+
+  const bodyPromise = new Promise((resolve, reject) => {
+    const req = http.get(`http://127.0.0.1:${port}/assets/bundle.js`, (res) => {
+      // Stop reading immediately: the server must buffer while backpressured.
+      res.pause();
+      setTimeout(() => res.resume(), 500);
+      const parts = [];
+      res.on("data", (c) => parts.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+  });
+
+  const open = await nextFrame(agent);
+  assert.equal(open.t, "open");
+  agent.send(JSON.stringify({ t: "head", id: open.id, status: 200, headers: { "content-type": "application/javascript" } }));
+  for (let i = 0; i < chunkCount; i++) {
+    agent.send(
+      JSON.stringify({
+        t: "data",
+        id: open.id,
+        b64: expected.subarray(i * chunkSize, (i + 1) * chunkSize).toString("base64"),
+        text: true,
+      }),
+    );
+  }
+  agent.send(JSON.stringify({ t: "close", id: open.id }));
+
+  const { status, body } = await bodyPromise;
+  assert.equal(status, 200);
+  assert.equal(body.length, expected.length, "body must not be truncated");
+  assert.ok(body.equals(expected), "every byte must survive the backpressure path");
+  agent.close();
+  await close();
+});
+
+test("agent data frame over 1 MiB is delivered, not killed", async () => {
+  // The desktop picks its own response chunk size; a b64 frame just past
+  // another transport's 1 MiB message cap must not get the agent socket
+  // terminated here (a 1009 kill truncates every in-flight response).
+  const handle = startServer({ relayKey: KEY, port: 0, logLevel: "error" });
+  await handle.ready();
+  const { port, close } = handle;
+  const agent = await attachedAgent(port);
+
+  const payload = Buffer.alloc(1.5 * 1024 * 1024); // b64 ~ 2 MiB > the old 1 MiB cap
+  for (let i = 0; i < payload.length; i++) payload[i] = (i * 13 + 5) % 256;
+
+  const phone = fetch(`http://127.0.0.1:${port}/assets/big.js`);
+  const open = await nextFrame(agent);
+  agent.send(JSON.stringify({ t: "head", id: open.id, status: 200, headers: { "content-type": "application/javascript" } }));
+  agent.send(JSON.stringify({ t: "data", id: open.id, b64: payload.toString("base64"), text: true }));
+  agent.send(JSON.stringify({ t: "close", id: open.id }));
+
+  const res = await phone;
+  assert.equal(res.status, 200);
+  const body = Buffer.from(await res.arrayBuffer());
+  assert.equal(body.length, payload.length);
+  assert.ok(body.equals(payload));
+  // The agent connection must still be alive afterwards.
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(agent.readyState, WebSocket.OPEN);
   agent.close();
   await close();
 });

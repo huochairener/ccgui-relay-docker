@@ -80,9 +80,14 @@ const MAX_BODY = 8 * 1024 * 1024; // 8 MiB cap: a huge Content-Length must not O
  * violations (e.g. a frame over maxPayload) and an unlistened 'error' on
  * an EventEmitter is an uncaught exception — one anonymous frame could
  * kill the whole process.
+ *
+ * Defined inside startServer so it can log WHY the socket was killed (a
+ * 1009 "frame too large" kill on the agent socket truncates every in-flight
+ * response — that must be visible in the log, not silent).
  */
-const killWs = (ws) => {
-  ws.on("error", () => {
+const makeKillWs = (log) => (ws) => {
+  ws.on("error", (err) => {
+    log.warn("websocket protocol error", { message: err?.message ?? String(err) });
     try {
       ws.terminate();
     } catch {}
@@ -152,9 +157,16 @@ export function startServer(options) {
     // refuses to start.
     onEvent: (event, data) => log.warn(`relay ${event}`, data),
   });
+  const killWs = makeKillWs(log);
   // Cloudflare caps Worker WebSocket frames at 1 MiB; matching it keeps both
   // entries on one protocol envelope and bounds memory amplification.
-  const wss = new WebSocketServer({ noServer: true, clientTracking: true, maxPayload: 1024 * 1024 });
+  // Accept up to 8 MiB though: the DESKTOP chooses its response chunk size,
+  // and a b64 frame right at another transport's 1 MiB edge (plus the JSON
+  // wrapper) must not get the agent socket terminated here — a 1009 kill
+  // truncates every in-flight response and looks exactly like "the phone
+  // page loads but the app never starts". Our own outgoing frames stay
+  // ≤ 256 KiB raw, so this only widens what we accept, not what we send.
+  const wss = new WebSocketServer({ noServer: true, clientTracking: true, maxPayload: 8 * 1024 * 1024 });
   // Handshake-layer errors must not reach the uncaught-exception handler.
   wss.on("error", () => {});
 
@@ -252,6 +264,7 @@ export function startServer(options) {
     let resEnded = false;
     let headWritten = false;
     let paused = false; // res.write backpressure: buffer until "drain"
+    let drainArmed = false; // one "drain" listener at a time (re-armed while paused)
     let bufferedBytes = 0;
     const MAX_BUFFERED = 4 * 1024 * 1024; // cap the backpressure buffer too
     /** @type {Uint8Array[]} buffered until writeHead commits the real headers / drain fires */
@@ -260,19 +273,44 @@ export function startServer(options) {
     const endRes = () => {
       if (resEnded) return;
       resEnded = true;
+      // Chunks still buffered under backpressure must ride the final
+      // res.end(): dropping them here would truncate the body — a
+      // half-delivered JS bundle surfaces as a SyntaxError in the phone's
+      // console and the app never boots.
+      if (headWritten) {
+        for (const chunk of pendingChunks.splice(0)) {
+          try {
+            res.write(chunk);
+          } catch {
+            break;
+          }
+        }
+      }
       res.end();
+    };
+    const armDrain = () => {
+      if (drainArmed || resEnded) return;
+      drainArmed = true;
+      res.once("drain", () => {
+        drainArmed = false;
+        paused = false;
+        flushPendingChunks();
+      });
     };
     const flushPendingChunks = () => {
       if (resEnded || headWritten === false || paused) return;
-      for (const chunk of pendingChunks.splice(0)) {
+      // Chunks stay buffered until they are HANDED to res.write: on a
+      // backpressure pause mid-flush the rest stays in pendingChunks for the
+      // next drain — never splice-then-abandon (that dropped the tail of
+      // every large asset served to a slow client).
+      while (pendingChunks.length) {
+        const chunk = pendingChunks.shift();
+        bufferedBytes -= chunk.length;
         const ok = res.write(chunk);
         if (!ok) {
           paused = true;
-          res.once("drain", () => {
-            paused = false;
-            flushPendingChunks();
-          });
-          break;
+          armDrain();
+          return; // the rest stays buffered; drain will resume the flush
         }
       }
     };
@@ -310,10 +348,7 @@ export function startServer(options) {
       const ok = res.write(bytes);
       if (!ok && !resEnded) {
         paused = true;
-        res.once("drain", () => {
-          paused = false;
-          flushPendingChunks();
-        });
+        armDrain();
       }
     };
     const pending = session.openHttpStream({

@@ -137,7 +137,35 @@ export class RelayDO {
     });
 
     const { status, headers: resHeaders } = await pending.head;
-    return new Response(stream, { status, headers: resHeaders });
+    // The relay chunks this body itself, so framing headers the DESKTOP
+    // declared (content-length, transfer-encoding) describe the desktop hop,
+    // not this response — forwarding a content-length alongside a stream body
+    // makes the runtime truncate or break the response. This is the same
+    // filtering the Node entry applies; without it every large asset served
+    // through the Worker was at risk of a truncated tail.
+    const validStatus = Number.isInteger(status) && status >= 100 && status <= 599;
+    const safeHeaders = {};
+    if (validStatus) {
+      for (const [name, value] of Object.entries(resHeaders ?? {})) {
+        if (
+          !/^[!-~]+$/.test(name) ||
+          typeof value !== "string" ||
+          /[\r\n\0]/.test(value) ||
+          !/^[\t -~]*$/.test(value)
+        ) {
+          continue; // drop the poisoned header, keep the rest
+        }
+        if (FRAMING_HEADERS.has(name.toLowerCase())) continue;
+        safeHeaders[name] = value;
+      }
+    }
+    if (!validStatus) {
+      // A corrupt head frame must not crash the Worker: settle the stream and
+      // answer 502 instead of letting new Response() throw.
+      pending.cancel();
+      return new Response("relay stream closed with an invalid head", { status: 502, headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+    return new Response(stream, { status, headers: safeHeaders });
   }
 
   /** Live socket (the app's /ws): frames travel both ways, unframed. */
