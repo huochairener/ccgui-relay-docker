@@ -24,8 +24,12 @@ function wsProbe(url, timeoutMs = 15000) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const done = (msg) => resolve(`${msg} in ${ms(Date.now() - t0)}`);
-    const mod = url.startsWith("https") ? https : http;
-    const req = mod.request(url.replace(/^ws/, "http"), {
+    // The handshake itself is plain HTTP: normalize ws:/wss: to http:/https:
+    // FIRST, then pick the module from the normalized URL (wss: starts with
+    // neither "http" nor "https", so checking before the swap picked http).
+    const httpUrl = url.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
+    const mod = httpUrl.startsWith("https") ? https : http;
+    const req = mod.request(httpUrl, {
       headers: {
         Connection: "Upgrade",
         Upgrade: "websocket",
